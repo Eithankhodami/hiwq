@@ -174,9 +174,18 @@ async def tag_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 async def receipt_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle receipt upload and save all data."""
+    # Log to help with debugging
+    logger.info(f"Receipt upload handler triggered. Message type: {type(update.message)}")
+    if update.message.photo:
+        logger.info(f"Photo received with {len(update.message.photo)} size options")
+    elif update.message.text:
+        logger.info(f"Text received: {update.message.text}")
+    
     # Initialize Google services
     try:
+        logger.info("Initializing Google services...")
         sheet, drive_service = init_google_services()
+        logger.info("Google services initialized successfully")
     except Exception as e:
         logger.error(f"Error initializing Google services: {e}")
         await update.message.reply_text(
@@ -200,36 +209,62 @@ async def receipt_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 
             # Get the largest photo
             photo = update.message.photo[-1]
-            file = await context.bot.get_file(photo.file_id)
+            logger.info(f"Processing photo with file_id: {photo.file_id}")
             
-            # Create a temporary file
-            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as temp_file:
-                # Download the photo
-                photo_url = file.file_path
-                response = requests.get(photo_url)
-                temp_file.write(response.content)
-                temp_file_path = temp_file.name
+            try:
+                file = await context.bot.get_file(photo.file_id)
+                logger.info(f"Got file info: {file.file_path}")
+                
+                # Create a temporary file
+                with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as temp_file:
+                    # Download the photo
+                    photo_url = file.file_path
+                    logger.info(f"Downloading from URL: {photo_url}")
+                    response = requests.get(photo_url)
+                    temp_file.write(response.content)
+                    temp_file_path = temp_file.name
+                    logger.info(f"Saved to temporary file: {temp_file_path}")
+            except Exception as download_error:
+                logger.error(f"Error downloading photo: {download_error}")
+                await update.message.reply_text("Error downloading your photo. Please try again.")
+                return RECEIPT_UPLOAD
             
             # Upload to Google Drive
-            file_metadata = {
-                'name': f"Receipt_{expense_data['date']}_{expense_data['place']}",
-                'parents': [FOLDER_ID]
-            }
-            
-            media = MediaFileUpload(
-                temp_file_path,
-                mimetype='image/jpeg',
-                resumable=True
-            )
-            
-            file = drive_service.files().create(
-                body=file_metadata,
-                media_body=media,
-                fields='id,webViewLink'
-            ).execute()
-            
-            drive_file_link = file.get('webViewLink', '')
-            expense_data['upload'] = drive_file_link
+            try:
+                file_metadata = {
+                    'name': f"Receipt_{expense_data['date']}_{expense_data['place']}",
+                    'parents': [FOLDER_ID]
+                }
+                
+                logger.info(f"Uploading to Google Drive folder: {FOLDER_ID}")
+                logger.info(f"File metadata: {file_metadata}")
+                
+                media = MediaFileUpload(
+                    temp_file_path,
+                    mimetype='image/jpeg',
+                    resumable=True
+                )
+                
+                # Send a message to indicate upload is in progress
+                progress_message = await update.message.reply_text("Uploading your receipt to Google Drive...")
+                
+                file = drive_service.files().create(
+                    body=file_metadata,
+                    media_body=media,
+                    fields='id,webViewLink'
+                ).execute()
+                
+                drive_file_link = file.get('webViewLink', '')
+                expense_data['upload'] = drive_file_link
+                
+                logger.info(f"File uploaded successfully. Link: {drive_file_link}")
+                
+                # Update progress message
+                await progress_message.edit_text("Receipt uploaded successfully!")
+            except Exception as upload_error:
+                logger.error(f"Error uploading to Google Drive: {upload_error}")
+                await update.message.reply_text("Error uploading to Google Drive. Will save expense data without receipt.")
+                expense_data['upload'] = "Upload failed - error"
             
             # Clean up the temporary file
             os.unlink(temp_file_path)
@@ -303,10 +338,10 @@ def main() -> None:
     # Get the token from environment variable
     token = os.environ.get("TELEGRAM_TOKEN", "7939992556:AAGUaWdemNJ31KiHBBvFhbuPFmZO1kUtWwo")
     
-    # Create the Application
-    application = Application.builder().token(token).build()
+    # Create the Application with appropriate settings to avoid conflicts
+    application = Application.builder().token(token).concurrent_updates(True).build()
 
-    # Add conversation handler
+    # Add conversation handler with per_chat=True to avoid conflicts
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -319,6 +354,9 @@ def main() -> None:
             RECEIPT_UPLOAD: [MessageHandler(filters.PHOTO | filters.TEXT & ~filters.COMMAND, receipt_upload)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        per_chat=True,
+        per_user=True,
+        per_message=False,
     )
 
     application.add_handler(conv_handler)
