@@ -13,6 +13,30 @@ import tempfile
 import requests
 import re
 from dateutil.relativedelta import relativedelta
+import hashlib
+import os
+
+PASSWORD, PASSWORD_AUTH = range(13, 15)
+
+PASSWORD_HASH = os.environ.get("BOT_PASSWORD_HASH", "5f4dcc3b5aa765d61d8327deb882cf99")  # Default "password"
+AUTHORIZED_USERS = {}  # Will store user_id: expiry_time
+
+# Function to hash a password
+def hash_password(password):
+    """Create MD5 hash of password"""
+    return hashlib.md5(password.encode()).hexdigest()
+
+# Function to check if a user is authorized
+def is_authorized(user_id):
+    """Check if a user is authorized"""
+    if user_id in AUTHORIZED_USERS:
+        expiry_time = AUTHORIZED_USERS[user_id]
+        if expiry_time > datetime.now():
+            return True
+        else:
+            # Authorization expired
+            del AUTHORIZED_USERS[user_id]
+    return False
 
 # Enable logging
 logging.basicConfig(
@@ -87,30 +111,107 @@ def init_google_services():
 FOLDER_ID = "10oET0doyJHwuF68Xi4su8A9xXHTPeRkN"  # Extract from your URL or set as env var
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Start conversation with main menu."""
+    """Start conversation with password check first."""
     user = update.effective_user
+    user_id = user.id
     
-    # Check if this is a callback or direct command
-    if update.callback_query:
-        await update.callback_query.answer()
-        message = update.callback_query.message
-        await message.edit_text(
-            f"Hi {user.first_name}! 📝 Let's record a new expense.\n\n"
-            f"First, please choose a date:",
-            reply_markup=get_calendar_keyboard()
-        )
+    # Check if user is already authorized
+    if is_authorized(user_id):
+        # User is authorized, proceed normally
+        if update.callback_query:
+            await update.callback_query.answer()
+            message = update.callback_query.message
+            await message.edit_text(
+                f"Hi {user.first_name}! 📝 Let's record a new expense.\n\n"
+                f"First, please choose a date:",
+                reply_markup=get_calendar_keyboard()
+            )
+        else:
+            await update.message.reply_text(
+                f"Hi {user.first_name}! Welcome to your expense tracking assistant! 💰\n\n"
+                f"What would you like to do?",
+                reply_markup=get_main_menu_keyboard()
+            )
+            return ConversationHandler.END  # End here and wait for menu selection
+        
+        # Initialize user data dictionary
+        context.user_data['expense'] = {}
+        
+        return CALENDAR_MONTH_SELECTION
     else:
+        # User needs to authenticate
+        if update.callback_query:
+            await update.callback_query.answer()
+            message = update.callback_query.message
+            await message.edit_text(
+                f"👋 Welcome, {user.first_name}! This bot is password protected.\n\n"
+                f"Please enter the password to continue:"
+            )
+        else:
+            await update.message.reply_text(
+                f"👋 Welcome, {user.first_name}! This bot is password protected.\n\n"
+                f"Please enter the password to continue:"
+            )
+        
+        return PASSWORD
+
+async def check_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Verify the password entered by the user."""
+    user = update.effective_user
+    entered_password = update.message.text
+    
+    # Hash the entered password
+    entered_hash = hash_password(entered_password)
+    
+    if entered_hash == PASSWORD_HASH:
+        # Password is correct, authorize user for 24 hours
+        AUTHORIZED_USERS[user.id] = datetime.now() + timedelta(hours=24)
+        
         await update.message.reply_text(
-            f"Hi {user.first_name}! Welcome to your expense tracking assistant! 💰\n\n"
+            f"✅ Authentication successful! Welcome, {user.first_name}.\n\n"
             f"What would you like to do?",
             reply_markup=get_main_menu_keyboard()
         )
-        return ConversationHandler.END  # End here and wait for menu selection
+        return ConversationHandler.END
+    else:
+        # Password is incorrect
+        await update.message.reply_text(
+            "❌ Incorrect password. Please try again or contact the bot owner."
+        )
+        return PASSWORD
+
+def check_auth_middleware(func):
+    """Middleware to check if user is authorized before processing commands."""
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        
+        # These commands are exempt from auth check
+        exempt_commands = ['start', 'cancel']
+        
+        # Check if this is a command and if it's in the exempt list
+        is_exempt = False
+        if update.message and update.message.text and update.message.text.startswith('/'):
+            command = update.message.text.split()[0][1:].split('@')[0]  # Extract command name
+            if command in exempt_commands:
+                is_exempt = True
+        
+        if is_exempt or is_authorized(user_id):
+            # User is authorized or using an exempt command, proceed
+            return await func(update, context)
+        else:
+            # User is not authorized
+            if update.callback_query:
+                await update.callback_query.answer("Authentication required")
+                await update.callback_query.message.reply_text(
+                    "⚠️ Your session has expired. Please use /start to authenticate again."
+                )
+            else:
+                await update.message.reply_text(
+                    "⚠️ You are not authorized to use this bot. Please use /start to authenticate."
+                )
+            return ConversationHandler.END
     
-    # Initialize user data dictionary
-    context.user_data['expense'] = {}
-    
-    return CALENDAR_MONTH_SELECTION
+    return wrapper
 
 def get_calendar_keyboard():
     """Generate a calendar keyboard for month selection."""
@@ -1562,20 +1663,423 @@ def main() -> None:
     # Run the bot
     application.run_polling()
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle errors in the dispatcher."""
-    logger.error("Exception while handling an update:", exc_info=context.error)
+async def handle_edit_field_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle selection of field to edit."""
+    query = update.callback_query
+    await query.answer()
     
-    # Send message to the user
-    if update and isinstance(update, Update) and update.effective_message:
-        if update.callback_query:
-            await update.callback_query.message.reply_text(
-                "Sorry, an error occurred while processing your request. Please try again."
+    if query.data == "back_to_edit_list":
+        # Go back to the list of expenses
+        message = await query.edit_message_text("Loading expenses...")
+        
+        class FakeQuery:
+            def __init__(self, message):
+                self.message = message
+                
+            async def edit_message_text(self, *args, **kwargs):
+                return await message.edit_text(*args, **kwargs)
+        
+        fake_query = FakeQuery(message)
+        await show_expenses_for_edit(fake_query, context)
+        return ConversationHandler.END
+    
+    try:
+        # Extract the field index from callback data
+        field_index = int(query.data.split('_')[2])
+        context.user_data['edit_field_index'] = field_index
+        
+        # Handle special cases
+        if field_index == 3:  # Category
+            # Show category selection
+            keyboard = [
+                [InlineKeyboardButton(category, callback_data=f"setcat_{display_name}")] 
+                for category, display_name in CATEGORIES.items()
+            ]
+            keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="back_to_fields")])
+            
+            await query.edit_message_text(
+                "Select a new category:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
+            return EDIT_VALUE
+            
+        elif field_index == 5:  # Tag
+            # Show tag selection
+            keyboard = [
+                [InlineKeyboardButton(tag, callback_data=f"settag_{display_name}")] 
+                for tag, display_name in TAGS.items()
+            ]
+            keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="back_to_fields")])
+            
+            await query.edit_message_text(
+                "Select a new tag:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return EDIT_VALUE
+            
+        elif field_index == 0:  # Date
+            # Show calendar for date selection
+            await query.edit_message_text(
+                "Please select a new date:",
+                reply_markup=get_calendar_keyboard()
+            )
+            context.user_data['edit_mode'] = True
+            return CALENDAR_MONTH_SELECTION
+            
+        elif field_index == 6:  # Receipt
+            # Important: Set up necessary context for receipt upload
+            # We need to ensure the expense data exists in the context
+            if 'expense' not in context.user_data:
+                context.user_data['expense'] = {}
+            
+            # Copy the data from the existing expense to the expense context
+            row_index = context.user_data.get('edit_row_index')
+            current_expense = context.user_data.get('edit_expense')
+            
+            if current_expense and len(current_expense) >= 7:
+                context.user_data['expense']['date'] = current_expense[0]
+                context.user_data['expense']['place'] = current_expense[1]
+                context.user_data['expense']['amount'] = current_expense[2]
+                context.user_data['expense']['category'] = current_expense[3]
+                context.user_data['expense']['receipt_number'] = current_expense[4]
+                context.user_data['expense']['tag'] = current_expense[5]
+            
+            await query.edit_message_text(
+                "Please upload a new receipt photo or type 'skip' to cancel:"
+            )
+            context.user_data['edit_mode'] = True
+            context.user_data['edit_receipt_upload'] = True
+            return RECEIPT_UPLOAD
+            
         else:
-            await update.effective_message.reply_text(
-                "Sorry, an error occurred while processing your request. Please try again."
+            # For other fields, ask for text input
+            field_names = ["date", "place", "amount", "category", "receipt number", "tag", "receipt"]
+            
+            await query.edit_message_text(
+                f"Please enter a new value for {field_names[field_index]}:"
             )
+            return EDIT_VALUE
+            
+    except Exception as e:
+        logger.error(f"Error in edit field selection: {e}")
+        await query.edit_message_text(
+            f"❌ Error selecting field: {str(e)}",
+            reply_markup=get_main_menu_keyboard()
+        )
+        return ConversationHandler.END
 
+# Modify the receipt_upload function to handle edit mode
+async def receipt_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle receipt upload and save all data."""
+    # Log to help with debugging
+    logger.info(f"Receipt upload handler triggered. Message type: {type(update.message)}")
+    if update.message.photo:
+        logger.info(f"Photo received with {len(update.message.photo)} size options")
+    elif update.message.text:
+        logger.info(f"Text received: {update.message.text}")
+    
+    # Check if we're in edit mode
+    edit_mode = context.user_data.get('edit_mode', False)
+    edit_receipt_upload = context.user_data.get('edit_receipt_upload', False)
+    
+    # Initialize Google services
+    try:
+        logger.info("Initializing Google services...")
+        sheet, drive_service = init_google_services()
+        logger.info("Google services initialized successfully")
+    except Exception as e:
+        logger.error(f"Error initializing Google services: {e}")
+        await update.message.reply_text(
+            "❌ There was an error connecting to Google services. Please try again later."
+        )
+        return ConversationHandler.END
+    
+    # Get expense data from context
+    expense_data = context.user_data.get('expense', {})
+    
+    if not expense_data:
+        logger.error("No expense data found in context")
+        await update.message.reply_text(
+            "❌ Error: Missing expense data. Please try again."
+        )
+        return ConversationHandler.END
+    
+    # Handle receipt upload
+    drive_file_link = ""
+    drive_file_id = ""
+    
+    if update.message.text and update.message.text.lower() == 'skip':
+        expense_data['upload'] = "No receipt"
+        
+        if edit_receipt_upload:
+            # If in edit mode and skipping, go back to the main menu
+            await update.message.reply_text(
+                "Receipt upload skipped. No changes made."
+            )
+            # Clear edit context
+            context.user_data.pop('edit_mode', None)
+            context.user_data.pop('edit_receipt_upload', None)
+            
+            # Show main menu
+            await update.message.reply_text(
+                "What would you like to do?",
+                reply_markup=get_main_menu_keyboard()
+            )
+            return ConversationHandler.END
+    else:
+        try:
+            if not update.message.photo:
+                await update.message.reply_text(
+                    "Please upload a photo or type 'skip'. Send the receipt as an image:"
+                )
+                return RECEIPT_UPLOAD
+                
+            # Get the largest photo
+            photo = update.message.photo[-1]
+            logger.info(f"Processing photo with file_id: {photo.file_id}")
+            
+            try:
+                file = await context.bot.get_file(photo.file_id)
+                logger.info(f"Got file info: {file.file_path}")
+                
+                # Create a temporary file
+                with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as temp_file:
+                    # Download the photo
+                    photo_url = file.file_path
+                    logger.info(f"Downloading from URL: {photo_url}")
+                    response = requests.get(photo_url)
+                    temp_file.write(response.content)
+                    temp_file_path = temp_file.name
+                    logger.info(f"Saved to temporary file: {temp_file_path}")
+            except Exception as download_error:
+                logger.error(f"Error downloading photo: {download_error}")
+                await update.message.reply_text("❌ Error downloading your photo. Please try again.")
+                return RECEIPT_UPLOAD
+            
+            # Upload to Google Drive
+            try:
+                file_metadata = {
+                    'name': f"Receipt_{expense_data.get('date', 'unknown')}_{expense_data.get('place', 'unknown')}",
+                    'parents': [FOLDER_ID]
+                }
+                
+                logger.info(f"Uploading to Google Drive folder: {FOLDER_ID}")
+                logger.info(f"File metadata: {file_metadata}")
+                
+                media = MediaFileUpload(
+                    temp_file_path,
+                    mimetype='image/jpeg',
+                    resumable=True
+                )
+                
+                # Send a message to indicate upload is in progress
+                progress_message = await update.message.reply_text("📤 Uploading your receipt to Google Drive...")
+                
+                file = drive_service.files().create(
+                    body=file_metadata,
+                    media_body=media,
+                    fields='id,webViewLink'
+                ).execute()
+                
+                drive_file_link = file.get('webViewLink', '')
+                drive_file_id = file.get('id', '')
+                expense_data['upload'] = f"[View Receipt]({drive_file_link})"
+                
+                logger.info(f"File uploaded successfully. Link: {drive_file_link}")
+                
+                # Update progress message
+                await progress_message.edit_text("✅ Receipt uploaded successfully!")
+                
+                # Clean up the temporary file
+                os.unlink(temp_file_path)
+                
+            except Exception as upload_error:
+                logger.error(f"Error uploading to Google Drive: {upload_error}")
+                await update.message.reply_text("❌ Error uploading to Google Drive. Will save expense data without receipt.")
+                expense_data['upload'] = "Upload failed - error"
+                
+        except Exception as e:
+            logger.error(f"Error in receipt handling: {e}")
+            await update.message.reply_text(
+                "❌ There was an error processing your receipt. The expense data will still be saved."
+            )
+            expense_data['upload'] = "Processing error"
+    
+    # Check if we're in edit mode for receipt upload
+    if edit_receipt_upload:
+        row_index = context.user_data.get('edit_row_index')
+        
+        if row_index and drive_file_link:
+            try:
+                # Update just the receipt cell (7th column, index 6)
+                sheet.update_cell(row_index, 7, expense_data['upload'])
+                
+                # Get updated row to confirm changes
+                updated_values = sheet.row_values(row_index)
+                
+                # Show success message with updated expense
+                message = (
+                    f"✅ Receipt updated successfully!\n\n"
+                    f"📅 Date: {updated_values[0]}\n"
+                    f"🏪 Place: {updated_values[1]}\n"
+                    f"💰 Amount: {updated_values[2]}\n"
+                    f"📂 Category: {updated_values[3]}\n"
+                    f"🧾 Receipt #: {updated_values[4]}\n"
+                    f"🏷️ Tag: {updated_values[5]}\n"
+                    f"📎 Receipt: {updated_values[6]}\n\n"
+                    f"What would you like to do next?"
+                )
+                
+                await update.message.reply_text(
+                    message,
+                    reply_markup=get_main_menu_keyboard(),
+                    parse_mode='Markdown'
+                )
+                
+                # Clear edit context
+                context.user_data.pop('edit_row_index', None)
+                context.user_data.pop('edit_field_index', None)
+                context.user_data.pop('edit_expense', None)
+                context.user_data.pop('edit_mode', None)
+                context.user_data.pop('edit_receipt_upload', None)
+                
+                return ConversationHandler.END
+                
+            except Exception as update_error:
+                logger.error(f"Error updating receipt: {update_error}")
+                await update.message.reply_text(
+                    f"❌ Error updating receipt: {str(update_error)}",
+                    reply_markup=get_main_menu_keyboard()
+                )
+                return ConversationHandler.END
+        else:
+            await update.message.reply_text(
+                "❌ Error: Missing row index or receipt link.",
+                reply_markup=get_main_menu_keyboard()
+            )
+            return ConversationHandler.END
+    
+    # If not in edit mode, proceed with normal expense saving
+    # Save to Google Sheet
+    try:
+        # Format the data for the sheet
+        row = [
+            expense_data['date'],
+            expense_data['place'],
+            expense_data['amount'],
+            expense_data['category'],
+            expense_data['receipt_number'],
+            expense_data['tag'],
+            expense_data['upload']
+        ]
+
+        # Append row and get its index
+        result = sheet.append_row(row)
+        row_index = len(sheet.get_all_values())  # Get the index of the newly added row
+        expense_data['row_index'] = row_index
+        
+        receipt_msg = (
+            f"📎 Receipt uploaded and linked." 
+            if drive_file_link else 
+            "📝 No receipt uploaded."
+        )
+        
+        # Confirm to the user
+        await update.message.reply_text(
+            f"✅ Expense saved successfully!\n\n"
+            f"📅 Date: {expense_data['date']}\n"
+            f"🏪 Place: {expense_data['place']}\n"
+            f"💰 Amount: {expense_data['amount']}\n"
+            f"📂 Category: {expense_data['category']}\n"
+            f"🧾 Receipt #: {expense_data['receipt_number']}\n"
+            f"🏷️ Tag: {expense_data['tag']}\n"
+            f"{receipt_msg}\n\n"
+            f"What would you like to do next?",
+            reply_markup=get_main_menu_keyboard(),
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error saving to Google Sheet: {e}")
+        await update.message.reply_text(
+            "❌ There was an error saving your expense data. Please try again later."
+        )
+    
+    # Clear user data
+    context.user_data.clear()
+    
+    return ConversationHandler.END
+
+def main() -> None:
+    """Run the bot."""
+    # Get the token from environment variable
+    token = os.environ.get("TELEGRAM_TOKEN", "7939992556:AAGUaWdemNJ31KiHBBvFhbuPFmZO1kUtWwo")
+    
+    # Create the Application with appropriate settings to avoid conflicts
+    application = Application.builder().token(token).concurrent_updates(True).build()
+
+    # Add main menu command handler with auth middleware
+    application.add_handler(CommandHandler("menu", check_auth_middleware(command_menu)))
+
+    # Add conversation handler for the expense tracking workflow
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", start),  # No middleware on start command
+            CallbackQueryHandler(check_auth_middleware(handle_menu_command), pattern=r"^cmd_"),
+            CallbackQueryHandler(check_auth_middleware(handle_view_date_callback), pattern=r"^view_"),
+            CallbackQueryHandler(check_auth_middleware(handle_edit_selection), pattern=r"^edit_\d+$"),
+            CallbackQueryHandler(check_auth_middleware(handle_delete_selection), pattern=r"^delete_\d+$"),
+        ],
+        states={
+            PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, check_password)],
+            CALENDAR_MONTH_SELECTION: [
+                CallbackQueryHandler(check_auth_middleware(handle_calendar_month), pattern=r"^(month_|date_|back_)")
+            ],
+            CALENDAR_DAY_SELECTION: [
+                CallbackQueryHandler(check_auth_middleware(handle_calendar_day), pattern=r"^(day_|back_)")
+            ],
+            DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, check_auth_middleware(date_input))],
+            PLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, check_auth_middleware(place_input))],
+            AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, check_auth_middleware(amount_input))],
+            CATEGORY: [CallbackQueryHandler(check_auth_middleware(category_callback))],
+            RECEIPT_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, check_auth_middleware(receipt_number_input))],
+            TAG: [CallbackQueryHandler(check_auth_middleware(tag_callback))],
+            RECEIPT_UPLOAD: [MessageHandler(filters.PHOTO | filters.TEXT & ~filters.COMMAND, check_auth_middleware(receipt_upload))],
+            SEARCH_DATE_RANGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, check_auth_middleware(search_date_range))],
+            EDIT_FIELD: [CallbackQueryHandler(check_auth_middleware(handle_edit_field_selection), pattern=r"^(edit_field_|back_)")],
+            EDIT_VALUE: [
+                CallbackQueryHandler(check_auth_middleware(handle_edit_value), pattern=r"^(setcat_|settag_|back_|day_)"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, check_auth_middleware(handle_edit_value))
+            ],
+            DELETE_CONFIRM: [CallbackQueryHandler(check_auth_middleware(handle_delete_confirm), pattern=r"^(confirm_|cancel_)")],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(check_auth_middleware(start), pattern=r"^cmd_start$"),
+            CallbackQueryHandler(check_auth_middleware(cancel), pattern=r"^back_to_menu$"),
+        ],
+        per_chat=True,
+        per_user=True,
+        per_message=False,
+    )
+
+    application.add_handler(conv_handler)
+
+    # Handle callback queries not handled by the conversation, also with auth middleware
+    application.add_handler(
+        CallbackQueryHandler(check_auth_middleware(handle_menu_command), pattern=r"^cmd_")
+    )
+    application.add_handler(
+        CallbackQueryHandler(check_auth_middleware(handle_view_date_callback), pattern=r"^view_")
+    )
+    application.add_handler(
+        CallbackQueryHandler(check_auth_middleware(cancel), pattern=r"^back_to_menu$")
+    )
+
+    # Add error handler
+    application.add_error_handler(error_handler)
+
+    # Run the bot
+    application.run_polling()
 if __name__ == "__main__":
     main()
