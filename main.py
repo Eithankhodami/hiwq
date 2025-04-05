@@ -18,7 +18,7 @@ import os
 
 PASSWORD, PASSWORD_AUTH = range(13, 15)
 
-PASSWORD_HASH = os.environ.get("BOT_PASSWORD_HASH", "5f4dcc3b5aa765d61d8327deb882cf99")  # Default "password"
+PASSWORD_HASH = os.environ.get("BOT_PASSWORD_HASH", "3af4a29036147a21b3e9623b3504c8fe")  # Default "password"
 AUTHORIZED_USERS = {}  # Will store user_id: expiry_time
 
 # Function to hash a password
@@ -2010,6 +2010,21 @@ async def receipt_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     return ConversationHandler.END
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle errors in the dispatcher."""
+    logger.error("Exception while handling an update:", exc_info=context.error)
+    
+    # Send message to the user
+    if update and isinstance(update, Update) and update.effective_message:
+        if update.callback_query:
+            await update.callback_query.message.reply_text(
+                "Sorry, an error occurred while processing your request. Please try again."
+            )
+        else:
+            await update.effective_message.reply_text(
+                "Sorry, an error occurred while processing your request. Please try again."
+            )
+            
 def main() -> None:
     """Run the bot."""
     # Get the token from environment variable
